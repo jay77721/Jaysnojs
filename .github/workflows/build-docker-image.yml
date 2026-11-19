@@ -6,6 +6,7 @@ on:
     paths:
       - 'Dockerfile'
       - 'index.js'
+      - 'auth-gateway.js'
       - 'package.json'
   pull_request:
     branches: [ main ]
