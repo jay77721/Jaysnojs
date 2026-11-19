@@ -17,15 +17,29 @@ function safeEqual(a, b) {
 
 function parseUrl(url) {
   try {
-    return new URL(url || '/', 'http://localhost');
+    const raw = String(url || '/').replace(/^\/+/, '/');
+    return new URL(raw, 'http://localhost');
   } catch {
     return null;
   }
 }
 
+function normalizePath(pathname) {
+  let value = String(pathname || '/');
+  try {
+    value = decodeURIComponent(value);
+  } catch {}
+  value = value.replace(/\/+/g, '/');
+  try {
+    value = new URL(value, 'http://localhost').pathname;
+  } catch {}
+  value = value.replace(/\/+$/, '').toLowerCase();
+  return value || '/';
+}
+
 function isSubscription(url) {
   const parsed = parseUrl(url);
-  return parsed !== null && parsed.pathname === `/${SUB_PATH}`;
+  return parsed !== null && normalizePath(parsed.pathname) === normalizePath(`/${SUB_PATH}`);
 }
 
 function getToken(req, parsed) {
