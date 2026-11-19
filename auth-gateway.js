@@ -4,7 +4,11 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const PUBLIC_PORT = Number(process.env.PORT || 3000);
-const INNER_PORT = Number(process.env.INNER_PORT || 3001);
+const INNER_PORT = Number(process.env.INNER_PORT || 3021);
+const CORE_PORT = Number(process.env.ARGO_PORT || 8001);
+const CORE_CHECK_INTERVAL = Number(process.env.CORE_CHECK_INTERVAL || 30000);
+const CORE_FAIL_LIMIT = Number(process.env.CORE_FAIL_LIMIT || 3);
+const CORE_GRACE_MS = Number(process.env.CORE_GRACE_MS || 120000);
 const SUB_PATH = String(process.env.SUB_PATH || 'sub').replace(/^\/+/, '');
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const INNER_HOST = '127.0.0.1';
@@ -86,6 +90,13 @@ const server = http.createServer((req, res) => {
   req.pipe(proxyReq);
 });
 
+if (INNER_PORT >= 3001 && INNER_PORT <= 3004) {
+  console.error(`INNER_PORT=${INNER_PORT} collides with the proxy core (3001-3004); the core will not start`);
+}
+if (INNER_PORT === PUBLIC_PORT) {
+  console.error(`INNER_PORT and PORT are both ${PUBLIC_PORT}; the gateway cannot listen`);
+}
+
 server.listen(PUBLIC_PORT, () => {
   console.log(`auth gateway listening on :${PUBLIC_PORT} -> :${INNER_PORT}`);
   if (!AUTH_TOKEN) console.log('AUTH_TOKEN is empty, subscription is public');
@@ -98,6 +109,36 @@ if (process.env.SKIP_INNER !== '1') {
     env: { ...process.env, SERVER_PORT: String(INNER_PORT) },
     stdio: 'inherit',
   });
+
+
+  if (process.env.CORE_WATCHDOG !== '0') {
+    const net = require('net');
+    const startedAt = Date.now();
+    let failures = 0;
+    const probe = () => new Promise((resolve) => {
+      const socket = net.connect({ host: '127.0.0.1', port: CORE_PORT });
+      const done = (value) => { socket.destroy(); resolve(value); };
+      socket.setTimeout(3000, () => done(false));
+      socket.on('connect', () => done(true));
+      socket.on('error', () => done(false));
+    });
+    const timer = setInterval(async () => {
+      if (Date.now() - startedAt < CORE_GRACE_MS) return;
+      if (await probe()) {
+        if (failures) console.log(`proxy core on :${CORE_PORT} is back`);
+        failures = 0;
+        return;
+      }
+      failures += 1;
+      console.error(`proxy core on :${CORE_PORT} is not listening (${failures}/${CORE_FAIL_LIMIT})`);
+      if (failures >= CORE_FAIL_LIMIT) {
+        failures = 0;
+        console.error('restarting the inner app to recover the proxy core');
+        child.kill('SIGTERM');
+      }
+    }, CORE_CHECK_INTERVAL);
+    timer.unref();
+  }
 
   child.on('exit', (code, signal) => {
     console.error(`inner app exited (code=${code}, signal=${signal})`);
