@@ -8,6 +8,7 @@ on:
       - 'index.js'
       - 'auth-gateway.js'
       - 'package.json'
+      - '.github/workflows/build-docker-image.yml'
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -39,11 +40,81 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/jayll:20000
+            ghcr.io/${{ github.repository_owner }}/jayll:20000-${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/jayll:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=HTTP Server
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # A green build used to mean "docker push worked", not "the thing runs": the
+  # port-collision image shipped broken. Start the image and assert the gateway
+  # answers and that the core is not fighting the gateway for a port.
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Pull the freshly built image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "ghcr.io/${{ github.repository_owner }}/jayll:20000-${{ github.sha }}"
+
+      - name: Start container
+        run: |
+          docker run -d --name jayll-smoke \
+            -e AUTH_TOKEN=smoke-token \
+            -e PORT=3000 \
+            -p 3000:3000 \
+            "ghcr.io/${{ github.repository_owner }}/jayll:20000-${{ github.sha }}"
+          for i in $(seq 1 30); do
+            sleep 2
+            if curl -fsS -m 3 http://127.0.0.1:3000/version >/dev/null 2>&1; then break; fi
+          done
+
+      - name: Assert gateway basics
+        run: |
+          set -e
+          echo "--- /version"
+          curl -fsS -m 5 http://127.0.0.1:3000/version
+          echo
+          echo "--- /sub without token must be 401"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:3000/sub)
+          echo "status=$code"
+          [ "$code" = "401" ]
+          echo "--- /sub with token must not be 401"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:3000/sub?token=smoke-token")
+          echo "status=$code"
+          [ "$code" != "401" ]
+
+      - name: Assert no port collision
+        run: |
+          set -e
+          logs=$(docker logs jayll-smoke 2>&1 || true)
+          echo "$logs" | tail -20
+          if echo "$logs" | grep -q 'collides with the proxy core'; then
+            echo "::error::gateway ports collide with the core ports"
+            exit 1
+          fi
+
+      - name: Report readiness (informational)
+        run: |
+          for i in $(seq 1 60); do
+            body=$(curl -s -m 3 http://127.0.0.1:3000/healthz || true)
+            if echo "$body" | grep -q '"ok":true'; then echo "healthz ok: $body"; break; fi
+            sleep 5
+          done
+          echo "final healthz: $(curl -s -m 3 http://127.0.0.1:3000/healthz || echo unavailable)"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs jayll-smoke 2>&1 | tail -50

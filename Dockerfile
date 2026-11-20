@@ -16,7 +16,13 @@ RUN apk update && apk upgrade &&\
 ENV INNER_PORT=3021
 ENV ARGO_PORT=8001
 
+# build stamp, shown by GET /version and GET /healthz
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
+# healthy means "core up AND tunnel answering" -- /healthz checks both, so a
+# silently dead cloudflared no longer shows up as a healthy container
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
-    CMD ss -ltn | grep -q ':8001' || exit 1
+    CMD curl -fsS http://127.0.0.1:3000/healthz | grep -q '"ok":true' || exit 1
 
 CMD ["node", "auth-gateway.js"]
