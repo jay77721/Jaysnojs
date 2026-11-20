@@ -1,27 +1,51 @@
+# syntax=docker/dockerfile:1
+
+# Binaries are baked in: nothing is downloaded at boot any more, so a dead
+# third-party mirror can no longer keep the container from starting.
+FROM alpine:3.20 AS binaries
+ARG TARGETARCH
+# optional egress proxy for local builds (CI leaves these empty)
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY
+ARG XRAY_VER=26.11.9
+ARG CFD_VER=2026.11.1
+RUN apk add --no-cache curl unzip ca-certificates && \
+    case "$TARGETARCH" in \
+      amd64) XZIP=Xray-linux-64.zip; CFD=cloudflared-linux-amd64 ;; \
+      arm64) XZIP=Xray-linux-arm64-v8a.zip; CFD=cloudflared-linux-arm64 ;; \
+      *) echo "unsupported arch $TARGETARCH"; exit 1 ;; \
+    esac && \
+    curl -fL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20 -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/${XZIP}" && \
+    unzip -q /tmp/xray.zip xray -d /out && chmod +x /out/xray && \
+    curl -fL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20 -o /out/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CFD_VER}/${CFD}" && \
+    chmod +x /out/xray /out/cloudflared && \
+    /out/xray version | head -1
+
 FROM node:alpine3.20
 
-WORKDIR /tmp
+RUN apk add --no-cache curl ca-certificates
 
-COPY . .
+WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev
 
-EXPOSE 3000/tcp
+COPY auth-gateway.js index.js ./
+COPY --from=binaries /out/xray /usr/local/bin/xray
+COPY --from=binaries /out/cloudflared /usr/local/bin/cloudflared
 
-RUN apk update && apk upgrade &&\
-    apk add --no-cache openssl curl gcompat iproute2 coreutils &&\
-    apk add --no-cache bash &&\
-    chmod +x index.js &&\
-    npm install
-
-# index.js runs the proxy core on 3001-3004, so the gateway must not use those
 ENV INNER_PORT=3021
 ENV ARGO_PORT=8001
+ENV FILE_PATH=./tmp
+ENV PROTOCOLS=vless,vmess,trojan
+ENV TRANSPORTS=ws,httpupgrade
 
-# build stamp, shown by GET /version and GET /healthz
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
 
-# healthy means "core up AND tunnel answering" -- /healthz checks both, so a
-# silently dead cloudflared no longer shows up as a healthy container
+EXPOSE 3000/tcp
+
+# healthy means "core up AND tunnel answering" -- /healthz checks both
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
     CMD curl -fsS http://127.0.0.1:3000/healthz | grep -q '"ok":true' || exit 1
 
